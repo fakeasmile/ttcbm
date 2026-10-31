@@ -22,40 +22,143 @@ import random
 import re
 import sys
 import time
+import unicodedata
 from collections import defaultdict
 from pathlib import Path
 
 STEP = "s0_03"
 
+# ---------------------------------------------------------------- 进度条
+
+
+class _PlainBar(object):
+    """tqdm 缺失时的退化进度条：每 10% 往 stderr 打一行，不改变迭代结果。"""
+
+    def __init__(self, iterable=None, total=None, desc="", **kwargs):
+        self.iterable = iterable
+        self.desc = desc or ""
+        if total is None and iterable is not None:
+            try:
+                total = len(iterable)
+            except TypeError:
+                total = None
+        self.total = total
+        self.n = 0
+        self.postfix = ""
+        self._next = 0.0
+        self._t0 = time.time()
+
+    def __iter__(self):
+        if self.iterable is None:
+            return
+        for item in self.iterable:
+            yield item
+            self.update(1)
+
+    def update(self, k=1):
+        self.n += k
+        self._report()
+
+    def _report(self, force=False):
+        if not self.total:
+            return
+        pct = float(self.n) / self.total
+        if not force and pct < self._next:
+            return
+        while self._next <= pct:
+            self._next += 0.1
+        tail = (" " + self.postfix) if self.postfix else ""
+        sys.stderr.write("[%s] %d/%d (%.0f%%) %.0fs%s\n"
+                         % (self.desc, self.n, self.total,
+                            pct * 100, time.time() - self._t0, tail))
+        sys.stderr.flush()
+
+    def set_postfix_str(self, s="", refresh=True):
+        self.postfix = s
+
+    def set_description(self, s=None, refresh=True):
+        if s is not None:
+            self.desc = s
+
+    def close(self):
+        self._report(force=True)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+        return False
+
+
+try:
+    from tqdm import tqdm as _tqdm
+except ImportError:
+    _tqdm = None
+
+
+def progress(iterable=None, total=None, desc="", **kwargs):
+    """统一进度条入口：有 tqdm 用它，没有退化为每 10% 一行。"""
+    if _tqdm is None:
+        return _PlainBar(iterable, total=total, desc=desc)
+    return _tqdm(iterable, total=total, desc=desc,
+                 dynamic_ncols=True, leave=False, **kwargs)
+
+
 # ---------------------------------------------------------------- 类目与判定树
 
-CLASS_TABLE = """\
-1  人物称谓：单数可指的人的标签（公知、圣母、小仙女、殖人、拳师）
-2  群体范畴：集合名词、可加"们"（河南人、女性、凤凰男、小镇做题家）
-3  亲属关系：关系项，亲属或伴侣（妈、祖宗、全家、孩子、老婆）
-4  机构与行动者：有组织性/制度性身份的实体（官媒、资本、境外势力、水军、NGO）
-5  观念与立场：被指称的观念、立场、主义（女权、政治正确、白左、普世价值）
-6  身体与性：身体部位、生理特征、性（部位名、生理词、性行为词）
-7  比拟物：被用作比拟的动物、物、污秽（狗、猪、蛆、韭菜、垃圾、屎）
-8  疾病与缺陷：疾病、残障、能力缺陷（精神病、智障、残废、艾滋）
-9  暴力与伤害手段：施于他人的伤害行为（打死、砍、强奸、人肉、开盒、举报、网暴）
-10 死亡与自伤：指向自身或结果状态的死亡（死、自杀、跳楼、绝症、活该、下地狱）"""
+ORDERED_RULES = """\
+从 Q1 开始逐条问，第一个回答"是"的就停下，取它后面的类号；十条都不成立才判 none。
 
-DECISION_TREE = """\
-Q1  是关系项（亲属/伴侣）                → 3
-Q2  是有组织性/制度性身份的实体           → 4
-Q3  是集合名词（可加"们"）且指人          → 2
-Q4  是单数可指的人的标签                  → 1
-Q5  是被指称的观念/立场/主义              → 5
-Q6  是身体部位/生理特征/性                → 6
-Q7  是疾病/残障/能力缺陷                  → 8
-Q8  是被用作比拟的动物/物/污秽            → 7
-Q9  是施于他人的伤害行为                  → 9
-Q10 是指向自身或结果状态的死亡            → 10
-否则                                      → 丢弃（两个字面/指称类都填 null）"""
+Q1  是亲属、伴侣等关系项？              → 3 类    妈、孩子、老婆、祖宗
+Q2  是有组织性/制度性身份的实体？        → 4 类    官媒、资本、水军、境外势力
+Q3  是指人的集合名词（可加"们"）？       → 2 类    河南人、女性、凤凰男、黑人
+Q4  是单数可指的人的标签？               → 1 类    公知、小仙女、司机、殖人
+Q5  是被指称的观念、立场、主义？         → 5 类    女权、政治正确、白左
+Q6  是身体部位、生理特征、性？           → 6 类    屁股、月经、性行为
+Q7  是疾病、残障、能力缺陷？             → 8 类    智障、精神病、艾滋、残废
+Q8  是被用作比拟的动物、物、污秽？       → 7 类    狗、猪、蛆、韭菜、垃圾
+Q9  是施于他人的伤害行为？               → 9 类    打死、强奸、开盒、网暴
+Q10 是指向自身或结果状态的死亡？         → 10 类   死、自杀、跳楼、活该"""
 
-EXAMPLE_LINE = ('{"term": "小仙女", "literal_class": 1, "referent_class": 1, '
-                '"reason": "对年轻女性的贬称"}')
+NONE_RULES = """\
+常见的 none 情形（不是穷举，十条都不成立时也判 none）：
+A 虚词、代词、副词、连词、语气词：是、有、说、会、要、能、就、都
+B 被切断的残片（以 的/了/得 起头或结尾、单独不成词）：的人、说的是、的对、了有
+C 地名、国名、省名本身：北京、日本、江苏、安徽省（"地名+人"如河南人不算，走 Q3）
+D 抽象名词、时间、数量、动作过程：教育、素质、社会、认为、出来
+
+注意：不许滥判 none。由常见语素组成的普通名词不是残片——黑人、女性、印度人、亚裔、
+智障、猪、学生、老人 都必须正常归类。拿不准时按最接近的一条归类，不要判 none。"""
+
+SCHEMA_LINES = """\
+每个候选输出一行 JSON，字段为 term / q / reason，可选 referent_class、literal_class：
+- q 必填，只能是 Q1、Q2……Q10 或 none
+- 类号由 q 决定：Q1→3 Q2→4 Q3→2 Q4→1 Q5→5 Q6→6 Q7→8 Q8→7 Q9→9 Q10→10，none→null
+- referent_class 可以省略；写了就必须与 q 推出的一致，不一致整条作废
+- reason 必须写出这个词本身，句式"某某指…"，不超过 20 字，不许抄上面的类目文字
+- literal_class 只在字面义与指称义明显不同时给（舔狗字面是动物，填 7），相同就省略
+- term 与输入逐字一致，不加序号；只输出 JSON 行，不要解释、不要代码块
+
+每行写完自查两点：q 与 referent_class 是否对应；reason 里有没有出现这个词。"""
+
+EXAMPLES = """\
+{"term": "孩子", "q": "Q1", "referent_class": 3, "reason": "孩子是亲属关系项"}
+{"term": "黑人", "q": "Q3", "referent_class": 2, "reason": "黑人指一个种族群体"}
+{"term": "智障", "q": "Q7", "referent_class": 8, "reason": "智障指能力缺陷"}
+{"term": "猪", "q": "Q8", "referent_class": 7, "reason": "猪用作物类比拟"}
+{"term": "打死", "q": "Q9", "referent_class": 9, "reason": "打死是施于他人的伤害"}
+{"term": "死", "q": "Q10", "referent_class": 10, "reason": "死指向自身生命的终结"}
+{"term": "舔狗", "q": "Q4", "referent_class": 1, "literal_class": 7, "reason": "舔狗指某类男性"}
+{"term": "北京", "q": "none", "referent_class": null, "reason": "北京是地名本身"}"""
+
+# q 与 referent_class 的对应，用于解析期一致性校验
+RULE_TO_CLASS = {"Q1": 3, "Q2": 4, "Q3": 2, "Q4": 1, "Q5": 5,
+                 "Q6": 6, "Q7": 8, "Q8": 7, "Q9": 9, "Q10": 10}
+
+# 断点记录必须具备的字段，缺任一条说明是旧 schema 的残留
+FIELDS = frozenset(("term", "literal_class", "class_id", "transfer",
+                    "source", "status"))
 
 # 兜底规则用的种子词表（人工维护，可改）。只在 3 轮 LLM 都判不出时使用。
 SEEDS = {
@@ -89,35 +192,29 @@ SEEDS = {
 }
 
 SYSTEM_PROMPT = (
-    "你是一名中文语料标注员。严格按给定判定树给候选词面归类，"
-    "只输出 JSON 行，不解释、不评论。"
+    "你是严谨的中文词表标注员。严格按有序判定链逐条判断、不跳步、不臆测，"
+    "只输出 JSON 行。"
 )
 
 
 def build_user_prompt(terms):
-    lines = []
-    lines.append("下面是一棵按优先级排序的判定树，从上往下执行，先命中先定类：")
-    lines.append(DECISION_TREE)
+    lines = ["给下面 %d 个候选词面归类。" % len(terms), ""]
+    lines.append(ORDERED_RULES)
     lines.append("")
-    lines.append("类目编号与内涵：")
-    lines.append(CLASS_TABLE)
+    lines.append(NONE_RULES)
     lines.append("")
-    lines.append("待判定候选（每行一个）：")
+    lines.append("输出格式：")
+    lines.append(SCHEMA_LINES)
+    lines.append("")
+    lines.append("示例：")
+    lines.append(EXAMPLES)
+    lines.append("")
+    lines.append("待判定的 %d 个候选：" % len(terms))
     for i, t in enumerate(terms, 1):
         lines.append("%d. %s" % (i, t))
     lines.append("")
-    lines.append("要求：")
-    lines.append("1. 每个候选先判“字面类”（这个词字面上像哪一类），再判“指称类”（在语料里实际指称的是哪一类）。"
-                 "指称类必须按判定树顺序执行。")
-    lines.append("2. 只判“指称的是什么”，不判褒贬、不判是否为侮辱。"
-                 "同一个词可能字面是一类、指称是另一类（如“舔狗”字面是动物、指称是人）。")
-    lines.append("3. 候选来自中文网络言论语料，可能是黑话、谐音、缩写或跨词碎片。"
-                 "若它是碎片、不像任何一类的指称物，两个字面/指称类都填 null。")
-    lines.append("4. 每个候选输出一行 JSON，字段固定为 term / literal_class / referent_class / reason。")
-    lines.append("5. literal_class 与 referent_class 取 1-10 的整数或 null；reason 不超过 20 个字。")
-    lines.append("6. term 必须与输入逐字一致，不要改写、不要带序号。")
-    lines.append("7. 只输出 JSON 行，不要代码块，不要多余文字。示例：")
-    lines.append(EXAMPLE_LINE)
+    lines.append("按上面的格式，为以上 %d 个候选各输出一行 JSON，一个都不能少。"
+                 % len(terms))
     return "\n".join(lines)
 
 
@@ -232,13 +329,16 @@ class ChatModel:
 
 LEAD_NUM = re.compile(r"^\s*\d+\s*[.、)．]\s*")
 QUOTES = "\"'“”‘’「」"
+# 候选词面本身不含标点（S0-2 的 INVALID_CHARS 已排除），所以尾部标点只可能是模型多加的
+TERM_TAIL = "：:，,。、;；!！?？"
 
 
 def clean_term(s):
     if not isinstance(s, str):
         return ""
     s = s.strip().strip(QUOTES).strip()
-    return LEAD_NUM.sub("", s).strip()
+    s = LEAD_NUM.sub("", s).strip()
+    return s.strip(TERM_TAIL).strip()
 
 
 def as_class(v):
@@ -253,7 +353,7 @@ def as_class(v):
         v = int(v)
         return (v, True) if 1 <= v <= 10 else (None, False)
     if isinstance(v, str):
-        s = v.strip().strip(QUOTES).lower()
+        s = unicodedata.normalize("NFKC", v).strip().strip(QUOTES).lower()
         if s in ("", "null", "none", "na", "n/a", "-"):
             return None, True
         if s.isdigit():
@@ -307,27 +407,62 @@ def extract_objects(text):
     return out
 
 
+def as_rule(v):
+    """把模型给的 q 归一成 Q1..Q10 / none；不合法返回 None。"""
+    if not isinstance(v, str):
+        return None
+    # NFKC 先把全角 Ｑ１ / 全角空格折成半角，再归一大小写
+    s = unicodedata.normalize("NFKC", v).strip().strip(QUOTES)
+    s = s.replace(" ", "").replace("　", "").upper()
+    if s in ("NONE", "NULL", "无", "-", "N/A"):
+        return "none"
+    if s in RULE_TO_CLASS:
+        return s
+    return None
+
+
 def parse_batch(text, expected):
-    """返回 {term: (literal, referent, reason)}，只收合法且未重复的条目。"""
+    """返回 {term: (literal, referent, reason, q)}，只收能自洽的条目。
+
+    三道硬校验，任一条不过即判 invalid（交给重试）：
+    1. q 与 referent_class 必须与 RULE_TO_CLASS 对应
+    2. reason 必须出现该词本身 —— 挡住"复读类目定义"的答案
+    3. 字段缺失不能当成判为 null
+    """
     got = {}
     for obj in extract_objects(text):
         term = clean_term(obj.get("term"))
         if term not in expected or term in got:
             continue
-        # §3.3 步骤 3：字段缺失即 invalid，不能把"没给"当成"判为 null"
-        if "literal_class" not in obj or "referent_class" not in obj:
+        if "q" not in obj:
             continue
-        lit, ok1 = as_class(obj.get("literal_class"))
-        ref, ok2 = as_class(obj.get("referent_class"))
-        if not (ok1 and ok2):
+        q = as_rule(obj.get("q"))
+        if q is None:
             continue
+        # 类号以 q 为准：模型只需选对"哪条规则先命中"，映射由脚本落
+        # 注意：这里不能复用 expected（那是本批词面集合），否则第二轮就崩
+        want = None if q == "none" else RULE_TO_CLASS[q]
+        if "referent_class" in obj:
+            ref, ok = as_class(obj["referent_class"])
+            if not ok or ref != want:
+                continue
+        else:
+            ref = want
+        if "literal_class" in obj:
+            lit, ok1 = as_class(obj["literal_class"])
+            if not ok1:
+                continue
+        else:
+            lit = None
         reason = obj.get("reason")
-        reason = reason.strip()[:40] if isinstance(reason, str) else ""
-        got[term] = (lit, ref, reason)
+        if not isinstance(reason, str) or term not in reason:
+            continue  # 挡住"复读类目定义"：理由里必须出现被判的词
+        reason = reason.strip()[:40]
+        got[term] = (lit, ref, reason, q)
     return got
 
 
-def make_record(term, lit, ref, reason, source):
+def make_record(term, lit, ref, reason, source, q=""):
     if ref is None:
         status = "drop" if source == "llm" else "unclassified"
         lit_out = lit
@@ -338,7 +473,7 @@ def make_record(term, lit, ref, reason, source):
         transfer = 1 if (lit is not None and lit != ref) else 0
     return {"term": term, "literal_class": lit_out, "class_id": ref,
             "transfer": transfer, "source": source, "status": status,
-            "reason": reason}
+            "reason": reason, "q": q}
 
 
 def rule_classify(term):
@@ -368,21 +503,24 @@ def read_candidates(path):
 
 
 def load_partial(path, meta):
-    """断点续跑：首行是 meta，不匹配则丢弃。"""
+    """断点续跑：首行是 meta，不匹配则整份丢弃；单行损坏只跳过该行。"""
     if not os.path.exists(path):
         return {}
     try:
         with open(path, "r", encoding="utf-8") as f:
-            head = f.readline()
-            m = json.loads(head)
-            if m != meta:
+            if json.loads(f.readline()) != meta:
                 return {}
             recs = {}
             for line in f:
                 line = line.strip()
                 if not line:
                     continue
-                r = json.loads(line)
+                try:
+                    r = json.loads(line)
+                except Exception:
+                    continue  # 上次写入被中断留下的残行，跳过即可重判
+                if not isinstance(r, dict) or not FIELDS <= set(r):
+                    continue  # 旧版本 schema 的记录不能用，重判
                 recs[r["term"]] = r
             return recs
     except Exception:
@@ -404,7 +542,7 @@ def export_sample(records, args, path):
             by_cls[r["class_id"]].append(r)
     with open(path, "w", encoding="utf-8-sig", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["term", "class_id", "source", "reason", "human_class"])
+        w.writerow(["term", "q", "class_id", "source", "reason", "human_class"])
         for cid in range(1, 11):
             items = by_cls.get(cid, [])
             rule = [x for x in items if x["source"] == "rule"]
@@ -419,7 +557,8 @@ def export_sample(records, args, path):
             else:
                 sel = (rule + llm)[:args.sample_per_class]
             for r in sel:
-                w.writerow([r["term"], cid, r["source"], r.get("reason", ""), ""])
+                w.writerow([r["term"], r.get("q", ""), cid, r["source"],
+                            r.get("reason", ""), ""])
 
 
 def build(args):
@@ -437,8 +576,14 @@ def build(args):
         try:
             with open(audit_path, "r", encoding="utf-8") as f:
                 audit = json.load(f)
-        except Exception:
-            audit = {}
+            if not isinstance(audit, dict):
+                raise ValueError("顶层不是 JSON 对象")
+        except Exception as e:
+            # 不能吞掉：audit 里还有 s0_01/s0_02 的记录，继续跑会整体覆盖
+            raise SystemExit(
+                "[ERROR] %s 存在但无法解析（%s）。\n"
+                "        继续运行会覆盖 s0_01 / s0_02 的审计记录。\n"
+                "        请先把它改名备份，再重跑本步。" % (audit_path, e))
 
     with open(cand_path, "rb") as f:
         input_sha1 = hashlib.sha1(f.read()).hexdigest()
@@ -446,7 +591,8 @@ def build(args):
     params = {"batch_size": args.batch_size, "retry_batch": args.retry_batch,
               "max_retries": args.max_retries, "max_new_tokens": args.max_new_tokens,
               "backend": args.backend, "model_path": str(args.model_path),
-              "max_model_len": args.max_model_len}
+              "max_model_len": args.max_model_len,
+              "seed": args.seed, "sample_per_class": args.sample_per_class}
     param_sig = hashlib.sha1(
         json.dumps(params, sort_keys=True).encode("utf-8")).hexdigest()
 
@@ -460,7 +606,11 @@ def build(args):
     rows = read_candidates(cand_path)
     terms = [t for t, _ in rows]
     df_map = dict(rows)
-    print("[input] %d 个候选" % len(terms))
+    # 打散后分批：同 df 相邻的词往往语义成串（男/女性/男人/女人/白人 会挤进同一批），
+    # 小模型在这种情况下会把整串塌缩成同一个答案。打散后每批异构，逼它逐条判。
+    work = list(terms)
+    random.Random(args.seed).shuffle(work)
+    print("[input] %d 个候选（已按 seed=%d 打散分批）" % (len(terms), args.seed))
 
     meta = {"input_sha1": input_sha1, "param_sig": param_sig}
     if args.force:
@@ -484,11 +634,23 @@ def build(args):
     if new_file:
         fp.write(json.dumps(meta, ensure_ascii=False) + "\n")
         fp.flush()
+    else:
+        # 上次可能被中断，末行没有换行符；不补的话新纪录会粘到残行上，两条一起废
+        try:
+            with open(partial_path, "rb") as fr:
+                fr.seek(0, os.SEEK_END)
+                if fr.tell() > 0:
+                    fr.seek(-1, os.SEEK_END)
+                    if fr.read(1) != b"\n":
+                        fp.write("\n")
+                        fp.flush()
+        except OSError:
+            pass
 
     rounds = []
     try:
         for rnd in range(args.max_retries + 1):
-            pending = [t for t in terms if t not in records]
+            pending = [t for t in work if t not in records]
             if not pending:
                 break
             size = args.batch_size if rnd == 0 else args.retry_batch
@@ -498,32 +660,40 @@ def build(args):
             print("[round %d] 待判 %d 条 / %d 批（每批 %d）"
                   % (rnd, len(pending), len(batches), size))
             done_batches = 0
-            for group in chunked(batches, args.chunk_batches):
-                prompts = [build_user_prompt(b) for b in group]
-                outs = model.generate(prompts, args.max_new_tokens)
-                fresh = []
-                for b, out in zip(group, outs):
-                    got = parse_batch(out, set(b))
-                    for term, (lit, ref, reason) in got.items():
-                        if term in records:
-                            continue
-                        rec = make_record(term, lit, ref, reason, "llm")
-                        records[term] = rec
-                        fresh.append(rec)
-                if fresh:
-                    append_partial(fp, fresh)
-                done_batches += len(group)
-                print("  批 %d/%d | 已判 %d/%d"
-                      % (done_batches, len(batches), len(records), len(terms)))
+            bar = progress(total=len(batches), desc="round %d 批" % rnd,
+                           unit="批")
+            try:
+                for group in chunked(batches, args.chunk_batches):
+                    prompts = [build_user_prompt(b) for b in group]
+                    outs = model.generate(prompts, args.max_new_tokens)
+                    fresh = []
+                    for b, out in zip(group, outs):
+                        got = parse_batch(out, set(b))
+                        for term, (lit, ref, reason, q) in got.items():
+                            if term in records:
+                                continue
+                            rec = make_record(term, lit, ref, reason, "llm", q)
+                            records[term] = rec
+                            fresh.append(rec)
+                    if fresh:
+                        append_partial(fp, fresh)
+                    done_batches += len(group)
+                    bar.update(len(group))
+                    bar.set_postfix_str("已判 %d/%d"
+                                        % (len(records), len(terms)))
+            finally:
+                bar.close()
+            print("  round %d 结束：批 %d/%d | 已判 %d/%d"
+                  % (rnd, done_batches, len(batches), len(records), len(terms)))
     finally:
         fp.close()
 
     # 规则兜底
-    pending = [t for t in terms if t not in records]
+    pending = [t for t in work if t not in records]
     if pending:
         print("[rule] 规则兜底 %d 条" % len(pending))
         fresh = []
-        for term in pending:
+        for term in progress(pending, desc="规则兜底", unit="条"):
             cid = rule_classify(term)
             rec = make_record(term, None, cid, "", "rule")
             records[term] = rec
@@ -557,6 +727,9 @@ def build(args):
     status_dist = {}
     for s in ("ok", "drop", "unclassified"):
         status_dist[s] = sum(1 for r in records.values() if r["status"] == s)
+    # §5 丢弃率 = 归不进十类的候选占比（drop 与 unclassified 都算没有类号）
+    total_n = len(terms) or 1
+    drop_rate = (status_dist["drop"] + status_dist["unclassified"]) / float(total_n)
 
     elapsed = time.time() - t0
     audit[STEP] = {
@@ -571,13 +744,17 @@ def build(args):
         },
         "class_dist": cls_dist,
         "status_dist": status_dist,
+        "drop_rate": round(drop_rate, 4),
         "transfer_count": sum(1 for r in records.values() if r["transfer"] == 1),
         "output_rows": len(out_rows),
         "elapsed_sec": round(elapsed, 1),
         "finished_at": time.strftime("%Y-%m-%d %H:%M:%S"),
     }
-    with open(audit_path, "w", encoding="utf-8") as f:
+    # 原子写：直接覆盖时若中途被打断，会把 s0_01/s0_02 的记录一起写坏
+    tmp_audit = audit_path + ".tmp"
+    with open(tmp_audit, "w", encoding="utf-8") as f:
         json.dump(audit, f, ensure_ascii=False, indent=2)
+    os.replace(tmp_audit, audit_path)
 
     if os.path.exists(partial_path):
         os.remove(partial_path)
@@ -590,6 +767,13 @@ def build(args):
              status_dist["unclassified"]))
     print("来源: LLM 判定 %d 条 / 规则兜底 %d 条"
           % (audit[STEP]["resolved"]["llm"], audit[STEP]["resolved"]["rule"]))
+    print("丢弃率 %.1f%%（drop %d + unclassified %d）/ 熔断线 %.0f%%"
+          % (drop_rate * 100, status_dist["drop"], status_dist["unclassified"],
+             args.drop_rate_stop * 100))
+    if drop_rate > args.drop_rate_stop:
+        print("-" * 62)
+        print("[警告] 丢弃率超过熔断线。按 §5：先抽 100 条分\"缺类\"/\"通用词\"两栏，")
+        print("       不要直接进 S0-5——若是缺类，补参数无用，得回 §1 重划类目轴。")
     print("各类: " + " ".join("%s:%d" % (k, v) for k, v in cls_dist.items()))
     print("转喻 transfer=1: %d" % audit[STEP]["transfer_count"])
     print("输出: %s" % out_path)
@@ -608,16 +792,28 @@ def parse_args(argv=None):
     ap.add_argument("--gpu_mem", type=float, default=0.85)
     ap.add_argument("--max_model_len", type=int, default=0,
                     help="0 表示不指定，用模型自身配置")
-    ap.add_argument("--batch_size", type=int, default=40)
-    ap.add_argument("--retry_batch", type=int, default=10)
+    ap.add_argument("--batch_size", type=int, default=8)
+    ap.add_argument("--retry_batch", type=int, default=4)
     ap.add_argument("--chunk_batches", type=int, default=8,
                     help="每次建模调用并行提交的批数（每批写一次断点）")
     ap.add_argument("--max_retries", type=int, default=3)
-    ap.add_argument("--max_new_tokens", type=int, default=2560)
+    ap.add_argument("--max_new_tokens", type=int, default=1280)
     ap.add_argument("--sample_per_class", type=int, default=30)
+    ap.add_argument("--drop_rate_stop", type=float, default=0.5,
+                    help="丢弃率熔断线，超过只警告不中断（§5）")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--force", action="store_true")
-    return ap.parse_args(argv)
+    args = ap.parse_args(argv)
+    # 这几个参数取到 0 或负数时不会报错，但结果会静默走偏：
+    # max_retries<0 → 一轮 LLM 都不跑，全部落到规则兜底，却照样打印"归类完成"
+    for name in ("batch_size", "retry_batch", "chunk_batches"):
+        if getattr(args, name) < 1:
+            ap.error("--%s 必须 >= 1" % name)
+    if args.max_retries < 0:
+        ap.error("--max_retries 必须 >= 0")
+    if args.sample_per_class < 1:
+        ap.error("--sample_per_class 必须 >= 1")
+    return args
 
 
 def main(argv=None):

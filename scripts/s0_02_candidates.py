@@ -34,6 +34,82 @@ except ImportError:
 
 STEP = "s0_02"
 
+# ---------------------------------------------------------------- 进度条
+
+
+class _PlainBar(object):
+    """tqdm 缺失时的退化进度条：每 10% 往 stderr 打一行，不改变迭代结果。"""
+
+    def __init__(self, iterable=None, total=None, desc="", **kwargs):
+        self.iterable = iterable
+        self.desc = desc or ""
+        if total is None and iterable is not None:
+            try:
+                total = len(iterable)
+            except TypeError:
+                total = None
+        self.total = total
+        self.n = 0
+        self.postfix = ""
+        self._next = 0.0
+        self._t0 = time.time()
+
+    def __iter__(self):
+        if self.iterable is None:
+            return
+        for item in self.iterable:
+            yield item
+            self.update(1)
+
+    def update(self, k=1):
+        self.n += k
+        self._report()
+
+    def _report(self, force=False):
+        if not self.total:
+            return
+        pct = float(self.n) / self.total
+        if not force and pct < self._next:
+            return
+        while self._next <= pct:
+            self._next += 0.1
+        tail = (" " + self.postfix) if self.postfix else ""
+        sys.stderr.write("[%s] %d/%d (%.0f%%) %.0fs%s\n"
+                         % (self.desc, self.n, self.total,
+                            pct * 100, time.time() - self._t0, tail))
+        sys.stderr.flush()
+
+    def set_postfix_str(self, s="", refresh=True):
+        self.postfix = s
+
+    def set_description(self, s=None, refresh=True):
+        if s is not None:
+            self.desc = s
+
+    def close(self):
+        self._report(force=True)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+        return False
+
+
+try:
+    from tqdm import tqdm as _tqdm
+except ImportError:
+    _tqdm = None
+
+
+def progress(iterable=None, total=None, desc="", **kwargs):
+    """统一进度条入口：有 tqdm 用它，没有退化为每 10% 一行。"""
+    if _tqdm is None:
+        return _PlainBar(iterable, total=total, desc=desc)
+    return _tqdm(iterable, total=total, desc=desc,
+                 dynamic_ncols=True, leave=False, **kwargs)
+
 # 单 token 允许的词性：名词类 + 动名兼类 + 动词 + 习用语/成语/简称/处所
 SINGLE_POS_OK = frozenset(("n", "nr", "ns", "nt", "nz", "ng", "vn", "v", "l", "i", "j", "s", "b"))
 # 多 token 禁止出现的词性**首字母**：代词/连词/介词/助词/副词/语气/叹词/量词
@@ -97,7 +173,7 @@ def collect(docs, args):
     token_tf = Counter()
     total_tokens = 0
 
-    for d_idx, doc in enumerate(docs):
+    for d_idx, doc in enumerate(progress(docs, desc="分词+候选", unit="篇")):
         text = doc.get("text", "")
         tokens = [(w, f) for w, f in pseg.cut(text)]
         for w, f in tokens:
@@ -177,7 +253,7 @@ def neighbor_entropy(docs, terms):
     rc = defaultdict(Counter)
     BOUND = "\x00"
 
-    for doc in docs:
+    for doc in progress(docs, desc="邻字熵", unit="篇"):
         s = WS_RE.sub("", doc.get("text", ""))
         n = len(s)
         for i in range(n):
