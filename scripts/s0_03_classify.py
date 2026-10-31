@@ -108,49 +108,53 @@ def progress(iterable=None, total=None, desc="", **kwargs):
 # ---------------------------------------------------------------- 类目与判定树
 
 ORDERED_RULES = """\
-从 Q1 开始逐条问，第一个回答"是"的就停下，取它后面的类号；十条都不成立才判 none。
+从 Q1 开始逐条问，第一个回答"是"的就停下，取它后面的类号。
 
-Q1  是亲属、伴侣等关系项？              → 3 类    妈、孩子、老婆、祖宗
-Q2  是有组织性/制度性身份的实体？        → 4 类    官媒、资本、水军、境外势力
-Q3  是指人的集合名词（可加"们"）？       → 2 类    河南人、女性、凤凰男、黑人
-Q4  是单数可指的人的标签？               → 1 类    公知、小仙女、司机、殖人
-Q5  是被指称的观念、立场、主义？         → 5 类    女权、政治正确、白左
-Q6  是身体部位、生理特征、性？           → 6 类    屁股、月经、性行为
-Q7  是疾病、残障、能力缺陷？             → 8 类    智障、精神病、艾滋、残废
-Q8  是被用作比拟的动物、物、污秽？       → 7 类    狗、猪、蛆、韭菜、垃圾
-Q9  是施于他人的伤害行为？               → 9 类    打死、强奸、开盒、网暴
-Q10 是指向自身或结果状态的死亡？         → 10 类   死、自杀、跳楼、活该"""
+Q1  是亲属、伴侣等关系项？                                          → 3 类    妈、孩子、老婆、祖宗
+Q2  是有组织形式或制度身份的主体？（机构、组织、公司、媒体、资本、势力） → 4 类    官媒、资本、水军、世界女权组织
+Q3  是指一个群体（不是一个具体个人）？                              → 2 类    女性、男性、黑人、白人、河南人、女、男
+Q4  是称呼某一类个人的标签（单数可指）？                            → 1 类    公知、小仙女、圣母、毒贩、司机
+Q5  是被指称的观念、立场、主义、制度？（抽象，不指具体人或组织）    → 5 类    女权、政治正确、白左、法西斯
+Q6  是身体部位、生理特征、性？                                      → 6 类    屁股、月经、性行为
+Q7  是疾病、残障、能力缺陷？（不指人、不指行为）                    → 8 类    智障、精神病、艾滋、残废
+Q8  是被用来指人或贬人的动物、物、污秽？（普通器物、普通动物名不算） → 7 类    狗、猪、蛆、韭菜、畜生
+Q9  是施于他人的伤害或致死行为？                                    → 9 类    打死、弄死、强奸、开盒、网暴
+Q10 是自身死亡、自伤？（程度夸张不算）                              → 10 类   死、自杀、跳楼、身亡"""
 
 NONE_RULES = """\
-常见的 none 情形（不是穷举，十条都不成立时也判 none）：
-A 虚词、代词、副词、连词、语气词：是、有、说、会、要、能、就、都
-B 被切断的残片（以 的/了/得 起头或结尾、单独不成词）：的人、说的是、的对、了有
-C 地名、国名、省名本身：北京、日本、江苏、安徽省（"地名+人"如河南人不算，走 Q3）
-D 抽象名词、时间、数量、动作过程：教育、素质、社会、认为、出来
+判 none 只适用于下面五种；逐条走完 Q1–Q10 都不成立时，也可以判 none：
+A 虚词、代词、副词、连词、助词、语气词：是、有、说、会、要、能、就、都
+B 被切断的残片（以 的/了/得 起头或结尾、单独不成词）：的人、说的是、的对
+C 地名、国名、省名本身：北京、日本、江苏（"地名+人"如河南人走 Q3）
+D 纯抽象过程、时间、数量：认为、出来、以后、一半、过于、接近
+E 程度夸张与口头固定搭配（字面不指实体）：笑死、累死、狗屁、狗头
 
-注意：不许滥判 none。由常见语素组成的普通名词不是残片——黑人、女性、印度人、亚裔、
-智障、猪、学生、老人 都必须正常归类。拿不准时按最接近的一条归类，不要判 none。"""
+不许把具体实体判成 none。下面这些必须归类，判 none 就是错：
+大汉、黄人、牛、工厂、族裔、男性、白人、学生、老人、智障、猪。
+由常见语素组成的普通名词不是残片：黑人、印度人、亚裔 都正常归类。"""
 
 SCHEMA_LINES = """\
-每个候选输出一行 JSON，字段为 term / q / reason，可选 referent_class、literal_class：
-- q 必填，只能是 Q1、Q2……Q10 或 none
-- 类号由 q 决定：Q1→3 Q2→4 Q3→2 Q4→1 Q5→5 Q6→6 Q7→8 Q8→7 Q9→9 Q10→10，none→null
-- referent_class 可以省略；写了就必须与 q 推出的一致，不一致整条作废
-- reason 必须写出这个词本身，句式"某某指…"，不超过 20 字，不许抄上面的类目文字
-- literal_class 只在字面义与指称义明显不同时给（舔狗字面是动物，填 7），相同就省略
+每个候选输出一行 JSON，四个字段都要有：term / q / literal_class / reason；referent_class 可选。
+- q 必填，只能是 Q1……Q10 或 none
+- literal_class 必填：这个词「字面上」是什么（1-10）。字面与指称相同时也照实填同一个数
+  （黑人字面就是人，填 2）；q=none 时填 null
+- referent_class 可省略；写了必须与 q 对应：Q1→3 Q2→4 Q3→2 Q4→1 Q5→5 Q6→6 Q7→8 Q8→7 Q9→9 Q10→10，
+  不一致整条作废
+- reason 必须写出这个词本身并说明它指什么，≤20 字，不许把类目名抄进来
+  错误："小姐姐指单数可指的人的标签"   正确："小姐姐指年轻女性"
 - term 与输入逐字一致，不加序号；只输出 JSON 行，不要解释、不要代码块
 
-每行写完自查两点：q 与 referent_class 是否对应；reason 里有没有出现这个词。"""
+写完自查三点：q 与 referent_class 对应吗；literal_class 填了吗；reason 里有这个词吗。"""
 
 EXAMPLES = """\
-{"term": "孩子", "q": "Q1", "referent_class": 3, "reason": "孩子是亲属关系项"}
-{"term": "黑人", "q": "Q3", "referent_class": 2, "reason": "黑人指一个种族群体"}
-{"term": "智障", "q": "Q7", "referent_class": 8, "reason": "智障指能力缺陷"}
-{"term": "猪", "q": "Q8", "referent_class": 7, "reason": "猪用作物类比拟"}
-{"term": "打死", "q": "Q9", "referent_class": 9, "reason": "打死是施于他人的伤害"}
-{"term": "死", "q": "Q10", "referent_class": 10, "reason": "死指向自身生命的终结"}
-{"term": "舔狗", "q": "Q4", "referent_class": 1, "literal_class": 7, "reason": "舔狗指某类男性"}
-{"term": "北京", "q": "none", "referent_class": null, "reason": "北京是地名本身"}"""
+{"term": "妈", "q": "Q1", "literal_class": 3, "reason": "妈是亲属关系"}
+{"term": "黑人", "q": "Q3", "literal_class": 2, "reason": "黑人指一个种族群体"}
+{"term": "男性", "q": "Q3", "literal_class": 2, "reason": "男性指男性群体"}
+{"term": "圣母", "q": "Q4", "literal_class": 1, "reason": "圣母讽刺某类讲道德的人"}
+{"term": "世界女权组织", "q": "Q2", "literal_class": 4, "reason": "世界女权组织是机构"}
+{"term": "舔狗", "q": "Q4", "literal_class": 7, "reason": "舔狗指某类男性，字面是狗"}
+{"term": "弄死", "q": "Q9", "literal_class": 9, "reason": "弄死是施于他人的致死行为"}
+{"term": "笑死", "q": "none", "literal_class": null, "reason": "笑死是程度夸张，不指死亡"}"""
 
 # q 与 referent_class 的对应，用于解析期一致性校验
 RULE_TO_CLASS = {"Q1": 3, "Q2": 4, "Q3": 2, "Q4": 1, "Q5": 5,
@@ -648,21 +652,24 @@ def build(args):
             pass
 
     rounds = []
+    ok_n = sum(1 for r in records.values() if r["status"] == "ok")
+    done_n = len(records)
+    # 一条贯穿全程的总进度条：total 是候选总数，重试轮不会让它回退
+    bar = progress(total=len(terms), desc="S0-3 归类", unit="条")
+    if done_n:
+        bar.update(done_n)
     try:
-        for rnd in range(args.max_retries + 1):
-            pending = [t for t in work if t not in records]
-            if not pending:
-                break
-            size = args.batch_size if rnd == 0 else args.retry_batch
-            batches = list(chunked(pending, size))
-            rounds.append({"round": rnd, "pending": len(pending),
-                           "batch_size": size, "batches": len(batches)})
-            print("[round %d] 待判 %d 条 / %d 批（每批 %d）"
-                  % (rnd, len(pending), len(batches), size))
-            done_batches = 0
-            bar = progress(total=len(batches), desc="round %d 批" % rnd,
-                           unit="批")
-            try:
+        try:
+            for rnd in range(args.max_retries + 1):
+                pending = [t for t in work if t not in records]
+                if not pending:
+                    break
+                size = args.batch_size if rnd == 0 else args.retry_batch
+                batches = list(chunked(pending, size))
+                rounds.append({"round": rnd, "pending": len(pending),
+                               "batch_size": size, "batches": len(batches)})
+                print("[round %d] 待判 %d 条 / %d 批（每批 %d）"
+                      % (rnd, len(pending), len(batches), size))
                 for group in chunked(batches, args.chunk_batches):
                     prompts = [build_user_prompt(b) for b in group]
                     outs = model.generate(prompts, args.max_new_tokens)
@@ -675,31 +682,33 @@ def build(args):
                             rec = make_record(term, lit, ref, reason, "llm", q)
                             records[term] = rec
                             fresh.append(rec)
+                            if rec["status"] == "ok":
+                                ok_n += 1
                     if fresh:
                         append_partial(fp, fresh)
-                    done_batches += len(group)
-                    bar.update(len(group))
-                    bar.set_postfix_str("已判 %d/%d"
-                                        % (len(records), len(terms)))
-            finally:
-                bar.close()
-            print("  round %d 结束：批 %d/%d | 已判 %d/%d"
-                  % (rnd, done_batches, len(batches), len(records), len(terms)))
-    finally:
-        fp.close()
+                    cur = len(records)
+                    bar.update(cur - done_n)
+                    done_n = cur
+                    bar.set_postfix_str("round %d | ok %d" % (rnd, ok_n))
+        finally:
+            fp.close()
 
-    # 规则兜底
-    pending = [t for t in work if t not in records]
-    if pending:
-        print("[rule] 规则兜底 %d 条" % len(pending))
-        fresh = []
-        for term in progress(pending, desc="规则兜底", unit="条"):
-            cid = rule_classify(term)
-            rec = make_record(term, None, cid, "", "rule")
-            records[term] = rec
-            fresh.append(rec)
-        with open(partial_path, "a", encoding="utf-8") as f:
-            append_partial(f, fresh)
+        # 规则兜底：这批也要计入总进度，否则条子走不满
+        pending = [t for t in work if t not in records]
+        if pending:
+            print("[rule] 规则兜底 %d 条" % len(pending))
+            fresh = []
+            for term in pending:
+                cid = rule_classify(term)
+                rec = make_record(term, None, cid, "", "rule")
+                records[term] = rec
+                fresh.append(rec)
+            with open(partial_path, "a", encoding="utf-8") as f:
+                append_partial(f, fresh)
+    finally:
+        cur = len(records)
+        bar.update(cur - done_n)
+        bar.close()
 
     # 输出
     order = {t: i for i, t in enumerate(terms)}
@@ -730,6 +739,9 @@ def build(args):
     # §5 丢弃率 = 归不进十类的候选占比（drop 与 unclassified 都算没有类号）
     total_n = len(terms) or 1
     drop_rate = (status_dist["drop"] + status_dist["unclassified"]) / float(total_n)
+    # literal_class 是转喻通道的前提：它空了，transfer 恒为 0，等于机制没生效
+    lit_filled = sum(1 for r in records.values()
+                     if r["literal_class"] is not None)
 
     elapsed = time.time() - t0
     audit[STEP] = {
@@ -745,6 +757,7 @@ def build(args):
         "class_dist": cls_dist,
         "status_dist": status_dist,
         "drop_rate": round(drop_rate, 4),
+        "literal_filled": lit_filled,
         "transfer_count": sum(1 for r in records.values() if r["transfer"] == 1),
         "output_rows": len(out_rows),
         "elapsed_sec": round(elapsed, 1),
@@ -775,7 +788,8 @@ def build(args):
         print("[警告] 丢弃率超过熔断线。按 §5：先抽 100 条分\"缺类\"/\"通用词\"两栏，")
         print("       不要直接进 S0-5——若是缺类，补参数无用，得回 §1 重划类目轴。")
     print("各类: " + " ".join("%s:%d" % (k, v) for k, v in cls_dist.items()))
-    print("转喻 transfer=1: %d" % audit[STEP]["transfer_count"])
+    print("转喻 transfer=1: %d（literal_class 已填 %d / ok %d）"
+          % (audit[STEP]["transfer_count"], lit_filled, status_dist["ok"]))
     print("输出: %s" % out_path)
     print("抽检: %s（每类 %d 条，人工填 human_class）"
           % (sample_path, args.sample_per_class))
